@@ -66,9 +66,38 @@ once the wrapper exists:
 ./gradlew installDebug
 ```
 
+Either way installs straight to whatever device `adb` currently sees — the
+emulator, or a physical phone once it's connected (see below).
+
 The first time you launch the app, it shows PhantomChat's normal onboarding —
 create a new identity or import an existing seed phrase/nsec, exactly as in
 the web app (including QR-code import, once camera permission is granted).
+
+### Testing on a physical phone
+
+**1. Enable Developer Options + USB debugging on the phone**
+- Settings → About phone → tap **Build number** 7 times ("You are now a
+  developer")
+- Settings → System → Developer options → enable **USB debugging**
+
+**2. Connect it**
+- Plug the phone into this machine via USB, then tap **Allow** on the "Allow
+  USB debugging?" popup on the phone (optionally check "Always allow from
+  this computer")
+- Or, without a cable — Settings → Developer options → **Wireless
+  debugging** → enable it → "Pair device with pairing code", which shows an
+  IP:port and a 6-digit code:
+  ```bash
+  adb pair <ip>:<pairing-port>   # enter the 6-digit code when prompted
+  adb connect <ip>:<connect-port>  # the main connect port shown on the same screen, not the pairing port
+  ```
+
+**3. Confirm it's visible, then build & install**
+```bash
+adb devices -l
+./gradlew installDebug
+```
+Once installed, open "PhantomAuto" from the app drawer like any other app.
 
 ## Current status
 
@@ -82,6 +111,23 @@ readout / voice reply), via Google's Desktop Head Unit (DHU) emulator — the
 notification shape it needs (`MessagingStyle` + `RemoteInput`) is already
 built and confirmed working, so this is a validation step rather than
 outstanding app work.
+
+An attempt to run this on an Android Studio emulator (AVD) hit a real
+environment wall: Google Play refuses to install the real Android Auto app
+there (`"This app isn't compatible with your device anymore"`), regardless of
+having a signed-in Google account — Play's device-compatibility filtering
+excludes most/all standard AVD profiles for Android Auto specifically, a
+known limitation independent of anything in this project. The Play-delivered
+Android Auto app is also a stub whose real functionality is a dynamic module
+fetched only once Play accepts the device, so this blocks before DHU pairing
+even becomes relevant. A real physical Android phone (which typically already
+has the full, non-stub app since it was installed through normal Play
+compatibility checks) with USB or wireless `adb` debugging is the practical
+way to complete this step — connect it, then follow Google's [DHU
+setup](https://developer.android.com/training/cars/testing#dhu) to enable
+developer settings + "Unknown sources" in the Android Auto app and pair it
+with the `desktop-head-unit` binary (already present at
+`$ANDROID_HOME/extras/google/auto/desktop-head-unit` on this machine).
 
 **Possible future work**: a `CarAppService` + `ConversationTemplate` for a
 richer, browsable in-car conversation screen, beyond notifications alone.
