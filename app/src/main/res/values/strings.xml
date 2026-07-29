@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">PhantomAuto</string>
+    <string name="connection_channel_name">PhantomChat connection</string>
+    <string name="connection_notification_title">PhantomChat is connected</string>
+    <string name="message_channel_name">PhantomChat messages</string>
+    <string name="reply_label">Reply</string>
+    <string name="me_label">You</string>
+    <string name="boot_prompt_channel_name">PhantomChat reconnect</string>
+    <string name="boot_prompt_title">Tap to reconnect PhantomChat</string>
+</resources>
