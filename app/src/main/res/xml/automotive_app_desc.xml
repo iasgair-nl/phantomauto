@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Declares to Android Auto that this app's MessagingStyle notifications should be
+     surfaced in the car (read aloud + voice reply), without needing the Car App Library
+     or a launcher icon in the car's app grid - the same declaration WhatsApp/Signal use. -->
+<automotiveApp>
+    <uses name="notification" />
+</automotiveApp>

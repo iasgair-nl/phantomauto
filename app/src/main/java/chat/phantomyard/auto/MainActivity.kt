@@ -14,6 +14,8 @@ import android.widget.FrameLayout
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import chat.phantomyard.auto.service.PhantomAutoService
 
 /**
@@ -52,6 +54,16 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         container = FrameLayout(this)
         setContentView(container)
+        // Apps targeting API 35+ get edge-to-edge enforced with no opt-out - content draws
+        // behind the status/nav bars by default. PhantomChat's own top nav (rendered inside
+        // the WebView) would end up under the status bar, where taps land on the system bar
+        // instead of the page. Pad the container by the system bar insets to keep the WebView
+        // clear of them, same as pre-edge-to-edge layout looked.
+        ViewCompat.setOnApplyWindowInsetsListener(container) { view, insets ->
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
+            insets
+        }
         requestNeededPermissions()
     }
 

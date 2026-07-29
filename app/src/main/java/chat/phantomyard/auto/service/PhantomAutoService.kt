@@ -24,6 +24,9 @@ import androidx.core.app.Person
 import androidx.core.app.RemoteInput
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.pm.ShortcutInfoCompat
+import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.core.graphics.drawable.IconCompat
 import chat.phantomyard.auto.BuildConfig
 import chat.phantomyard.auto.MainActivity
 import chat.phantomyard.auto.R
@@ -49,13 +52,20 @@ class PhantomAutoService : Service() {
 
     // Context (needed for getString) isn't attached yet when property initializers run,
     // so this must stay lazy rather than eagerly built.
-    private val mePerson by lazy { Person.Builder().setName(getString(R.string.me_label)).build() }
+    private val mePerson by lazy {
+        Person.Builder()
+            .setName(getString(R.string.me_label))
+            .setKey("me")
+            .setIcon(IconCompat.createWithResource(this, R.mipmap.ic_launcher))
+            .build()
+    }
 
     // One MessagingStyle per conversation, kept in memory so new messages append to the
     // existing thread instead of replacing it, and so an optimistic reply can be added
     // immediately when the user answers from the notification.
     private val messagingStyles = mutableMapOf<String, NotificationCompat.MessagingStyle>()
     private val conversationPeerNames = mutableMapOf<String, String>()
+    private val conversationPeerKeys = mutableMapOf<String, String>()
 
     inner class LocalBinder : Binder() {
         fun getService(): PhantomAutoService = this@PhantomAutoService
@@ -157,14 +167,24 @@ class PhantomAutoService : Service() {
         val text = payload.optString("text")
         if (text.isEmpty()) return
         val senderName = payload.optString("senderName", "PhantomChat")
+        val peerPubkey = payload.optString("peerPubkey", conversationId)
         val timestamp = payload.optLong("timestamp", System.currentTimeMillis())
         conversationPeerNames[conversationId] = senderName
+        conversationPeerKeys[conversationId] = peerPubkey
 
-        val senderPerson = Person.Builder().setName(senderName).build()
+        val senderPerson = buildPerson(senderName, peerPubkey)
         val style = messagingStyleFor(conversationId, senderName)
         style.addMessage(text, timestamp, senderPerson)
 
         notify(conversationId, style)
+    }
+
+    private fun buildPerson(name: String, key: String): Person {
+        return Person.Builder()
+            .setName(name)
+            .setKey(key)
+            .setIcon(IconCompat.createWithResource(this, R.mipmap.ic_launcher))
+            .build()
     }
 
     /**
@@ -213,6 +233,9 @@ class PhantomAutoService : Service() {
 
     private fun notify(conversationId: String, style: NotificationCompat.MessagingStyle) {
         val notificationId = conversationId.hashCode()
+        val senderName = conversationPeerNames[conversationId] ?: "PhantomChat"
+        val peerKey = conversationPeerKeys[conversationId] ?: conversationId
+        publishConversationShortcut(conversationId, senderName, peerKey)
 
         val replyIntent = ReplyReceiver.buildIntent(this, conversationId)
         val replyPendingIntent = PendingIntent.getBroadcast(
@@ -224,12 +247,33 @@ class PhantomAutoService : Service() {
         val remoteInput = RemoteInput.Builder(ReplyReceiver.KEY_REPLY_TEXT)
             .setLabel(getString(R.string.reply_label))
             .build()
+        // Android Auto requires these two exact semantic actions on messaging notifications
+        // (https://developer.android.com/training/cars/communication/notification-messaging) -
+        // without them it silently drops the notification rather than surfacing it, even
+        // though the notification still shows/mirrors fine everywhere else (e.g. Wear OS).
         val replyAction = NotificationCompat.Action.Builder(
             R.drawable.ic_notification,
             getString(R.string.reply_label),
             replyPendingIntent
         ).addRemoteInput(remoteInput)
             .setAllowGeneratedReplies(true)
+            .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
+            .setShowsUserInterface(false)
+            .build()
+
+        val markReadIntent = MarkReadReceiver.buildIntent(this, conversationId)
+        val markReadPendingIntent = PendingIntent.getBroadcast(
+            this,
+            notificationId,
+            markReadIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val markReadAction = NotificationCompat.Action.Builder(
+            R.drawable.ic_notification,
+            getString(R.string.mark_read_label),
+            markReadPendingIntent
+        ).setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_MARK_AS_READ)
+            .setShowsUserInterface(false)
             .build()
 
         val contentIntent = PendingIntent.getActivity(
@@ -243,10 +287,38 @@ class PhantomAutoService : Service() {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setContentIntent(contentIntent)
             .addAction(replyAction)
+            .addInvisibleAction(markReadAction)
             .setAutoCancel(true)
+            .setShortcutId(conversationId)
             .build()
 
         NotificationManagerCompat.from(this).notify(notificationId, notification)
+    }
+
+    /** Invoked by MarkReadReceiver - Android Auto (and other surfaces) may fire the
+     * invisible mark-as-read action without any user-visible interaction. Resets the
+     * conversation's notification thread so a future message starts a fresh, unread style. */
+    fun markConversationRead(conversationId: String) {
+        messagingStyles.remove(conversationId)
+        NotificationManagerCompat.from(this).cancel(conversationId.hashCode())
+    }
+
+    /**
+     * Android Auto (unlike Wear OS's generic notification mirroring) only surfaces
+     * MessagingStyle notifications that are backed by a long-lived "Conversation" shortcut -
+     * without this, the notification still exists and mirrors fine elsewhere, but Android
+     * Auto silently ignores it. The shortcut ID must match the notification's setShortcutId.
+     */
+    private fun publishConversationShortcut(conversationId: String, senderName: String, peerKey: String) {
+        val person = buildPerson(senderName, peerKey)
+        val shortcut = ShortcutInfoCompat.Builder(this, conversationId)
+            .setLongLived(true)
+            .setShortLabel(senderName)
+            .setIcon(IconCompat.createWithResource(this, R.mipmap.ic_launcher))
+            .setPerson(person)
+            .setIntent(Intent(this, MainActivity::class.java).setAction(Intent.ACTION_VIEW))
+            .build()
+        ShortcutManagerCompat.pushDynamicShortcut(this, shortcut)
     }
 
     private fun createNotificationChannels() {

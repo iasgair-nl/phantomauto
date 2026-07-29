@@ -106,36 +106,68 @@ relays (not mocked): identity persistence, live incoming messages producing
 notifications, notification replies actually sending, permission prompts, and
 boot-time recovery.
 
-**Not yet verified**: behavior in an actual Android Auto head unit (voice
-readout / voice reply), via Google's Desktop Head Unit (DHU) emulator — the
-notification shape it needs (`MessagingStyle` + `RemoteInput`) is already
-built and confirmed working, so this is a validation step rather than
-outstanding app work.
+**Not yet working: the notification doesn't actually surface in Android
+Auto.** Tested live in a real car (Fairphone 6, real Android Auto session
+with Maps/media active) with a bot pinging every minute. The notification
+posts correctly and is confirmed received system-wide (it mirrors fine to a
+Wear OS watch, and the phone's own notification-listener log shows it being
+delivered), but it never appears in Android Auto itself.
+
+What's been ruled out / already fixed while chasing this (see "Bugs found"
+below for detail): missing `automotive_app_desc.xml` declaration, missing
+semantic actions (`SEMANTIC_ACTION_REPLY` / `SEMANTIC_ACTION_MARK_AS_READ`),
+missing invisible mark-as-read action, missing conversation shortcut,
+missing `Person.setKey()`/icons. `CarExtender` was investigated and
+confirmed **not** required by the current official docs. The AVD emulator's
+Play-compatibility block (see below) is not the cause either — this was
+tested on a real phone with the full, non-stub Android Auto app.
+
+What's confirmed via `adb`:
+- `adb shell settings get secure enabled_notification_listeners` shows
+  `com.google.android.projection.gearhead/...SharedNotificationListenerManager$ListenerService`
+  is registered and enabled, so Android Auto's own listener is live.
+- There's no separate per-app "Notifications" toggle inside the modern
+  Android Auto settings screens to check (that UI has apparently been
+  removed/folded into the OS in current versions) — nothing to misconfigure
+  there.
+- `logcat` shows zero trace of gearhead's listener acting on the
+  notification at all (only the launcher's own badge-counting listener logs
+  receiving it) — but this is a release build with no verbose logging, so
+  that's not conclusive proof gearhead ignored it vs. silently declining it.
+
+**Next steps for whoever picks this up**: with everything in the official
+docs now implemented, the remaining candidates are less certain — a
+Fairphone/OEM-specific restriction on non-Play-verified apps, a real
+Android Auto bug/limitation, or something in the exact notification/shortcut
+shape still not quite matching what Android Auto expects that isn't spelled
+out in the docs. Getting verbose logs out of the real `gearhead` app (e.g.
+`setprop log.tag.<tag> DEBUG` if the right tags can be identified) or
+testing against the DHU (see below) to get a friendlier debugging surface
+would be the next avenues.
 
 An attempt to run this on an Android Studio emulator (AVD) hit a real
-environment wall: Google Play refuses to install the real Android Auto app
-there (`"This app isn't compatible with your device anymore"`), regardless of
-having a signed-in Google account — Play's device-compatibility filtering
-excludes most/all standard AVD profiles for Android Auto specifically, a
-known limitation independent of anything in this project. The Play-delivered
-Android Auto app is also a stub whose real functionality is a dynamic module
-fetched only once Play accepts the device, so this blocks before DHU pairing
-even becomes relevant. A real physical Android phone (which typically already
-has the full, non-stub app since it was installed through normal Play
-compatibility checks) with USB or wireless `adb` debugging is the practical
-way to complete this step — connect it, then follow Google's [DHU
-setup](https://developer.android.com/training/cars/testing#dhu) to enable
-developer settings + "Unknown sources" in the Android Auto app and pair it
-with the `desktop-head-unit` binary (already present at
-`$ANDROID_HOME/extras/google/auto/desktop-head-unit` on this machine).
+environment wall, separate from the above: Google Play refuses to install
+the real Android Auto app there (`"This app isn't compatible with your
+device anymore"`), regardless of having a signed-in Google account — Play's
+device-compatibility filtering excludes most/all standard AVD profiles for
+Android Auto specifically, a known limitation independent of anything in
+this project. The Play-delivered Android Auto app is also a stub whose real
+functionality is a dynamic module fetched only once Play accepts the device,
+so this blocks before DHU pairing even becomes relevant there. The DHU
+binary is already present at
+`$ANDROID_HOME/extras/google/auto/desktop-head-unit` on this machine and can
+be paired with a real phone instead, per Google's [DHU
+setup](https://developer.android.com/training/cars/testing#dhu) — this may
+give better error visibility than a real car does.
 
 **Possible future work**: a `CarAppService` + `ConversationTemplate` for a
 richer, browsable in-car conversation screen, beyond notifications alone.
 
 ## Bugs found during real-world testing
 
-Three real issues surfaced only once actually exercised end-to-end (emulator
-+ a second live identity), not from writing the code alone:
+Real issues surfaced only once actually exercised end-to-end (emulator + a
+second live identity, and later a physical phone), not from writing the code
+alone:
 
 1. **Bridge attach timeout too short.** The bridge's poll for
    `window.__phantomchatChatAPI` gave up after 30s; identity setup or a PIN
@@ -154,3 +186,36 @@ Three real issues surfaced only once actually exercised end-to-end (emulator
    "tap to reconnect" notification instead of forcing a background start;
    tapping it opens the app, which starts the service through a normal,
    user-initiated launch.
+4. **Top nav bar unreachable on a real phone (Fairphone 6).** Apps targeting
+   API 35+ get edge-to-edge layout enforced with no opt-out — PhantomChat's
+   own top nav (search bar, hamburger menu) was drawing underneath the status
+   bar, where taps landed on the system bar instead of the page. Only showed
+   up on real hardware, not the emulator. Fixed by padding `MainActivity`'s
+   container view by the system bar insets (`ViewCompat.
+   setOnApplyWindowInsetsListener` + `WindowInsetsCompat.Type.systemBars()`).
+5. **Missing car-support manifest declaration.** The manifest was missing the
+   `com.google.android.gms.car.application` meta-data / `automotive_app_desc.xml`
+   declaration that tells Android Auto "this app's notifications should be
+   surfaced in the car." Added `res/xml/automotive_app_desc.xml`
+   (`<uses name="notification" />`) and referenced it from the manifest. On
+   its own this did **not** fix the underlying "not surfaced in Android Auto"
+   issue (see "Current status" above) — it's a necessary but apparently not
+   sufficient piece.
+6. **Missing required semantic actions.** Per Android's [messaging
+   notifications for Android
+   Auto](https://developer.android.com/training/cars/communication/notification-messaging)
+   guide, the reply action needs `setSemanticAction(SEMANTIC_ACTION_REPLY)` +
+   `setShowsUserInterface(false)`, and there must be a separate **invisible**
+   mark-as-read action (`setSemanticAction(SEMANTIC_ACTION_MARK_AS_READ)`,
+   added via `addInvisibleAction(...)`, not `addAction(...)`). Both were
+   missing; added the semantic action to the existing reply action and a new
+   `MarkReadReceiver` + invisible action for mark-as-read.
+   `NotificationCompat.Builder.extend(CarExtender(...))`, mentioned in some
+   older/secondary sources, was checked against the current official doc and
+   confirmed **not** required — skipped.
+7. **`Person` objects missing `setKey()`/icon.** The official sample sets a
+   stable `setKey()` and an icon on both the "me" and sender `Person` objects
+   in `MessagingStyle`; ours had neither. Added both (key = the peer's
+   pubkey, or `"me"`), matching the shortcut's `Person` so they're
+   consistent. Like #5, this is a reasonable correctness fix but not
+   confirmed to be the actual blocker either.
