@@ -6,12 +6,14 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.PermissionRequest
@@ -49,6 +51,7 @@ class PhantomAutoService : Service() {
 
     private val binder = LocalBinder()
     private var webView: WebView? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     // Context (needed for getString) isn't attached yet when property initializers run,
     // so this must stay lazy rather than eagerly built.
@@ -75,11 +78,12 @@ class PhantomAutoService : Service() {
         super.onCreate()
         instance = this
         createNotificationChannels()
+        acquireWakeLock()
         ServiceCompat.startForeground(
             this,
             CONNECTION_NOTIFICATION_ID,
             buildConnectionNotification(),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
         )
     }
 
@@ -340,6 +344,24 @@ class PhantomAutoService : Service() {
         )
     }
 
+    private fun acquireWakeLock() {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PhantomAuto::ServiceWakeLock").also {
+            // Keep the CPU awake while the service is running. A 12-hour timeout as a safety net
+            // to ensure it eventually releases even if onDestroy is somehow bypassed.
+            it.acquire(12 * 60 * 60 * 1000L /*12 hours*/)
+        }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let {
+            if (it.isHeld) {
+                it.release()
+            }
+        }
+        wakeLock = null
+    }
+
     private fun buildConnectionNotification(): Notification {
         val openAppIntent = Intent(this, MainActivity::class.java)
         val contentIntent = PendingIntent.getActivity(
@@ -357,6 +379,7 @@ class PhantomAutoService : Service() {
 
     override fun onDestroy() {
         instance = null
+        releaseWakeLock()
         webView?.destroy()
         webView = null
         super.onDestroy()

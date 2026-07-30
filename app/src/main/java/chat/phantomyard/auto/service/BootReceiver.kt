@@ -16,13 +16,14 @@ private const val BOOT_PROMPT_CHANNEL_ID = "phantomauto_boot_prompt"
 private const val BOOT_PROMPT_NOTIFICATION_ID = 2
 
 /**
- * PhantomAutoService can't be auto-restarted directly from here: Android refuses to start
- * a `dataSync`-type foreground service from a BOOT_COMPLETED context (confirmed even when
- * routed through an expedited WorkManager job - the restriction tracks the app's
- * background-start eligibility during the boot window, not the specific call stack that
- * triggers it). A plain notification carries no such restriction, so this posts a
- * tap-to-reconnect prompt instead; tapping it opens MainActivity, which starts the service
- * through a normal, user-initiated launch.
+ * PhantomAutoService can't be auto-restarted directly from here: Android refused to start
+ * this service from a BOOT_COMPLETED context when it was still a `dataSync`-type foreground
+ * service (confirmed even when routed through an expedited WorkManager job - the restriction
+ * tracked the app's background-start eligibility during the boot window, not the specific
+ * call stack that triggered it). Not re-verified since switching to `remoteMessaging`. A
+ * plain notification carries no such restriction either way, so this posts a tap-to-reconnect
+ * prompt instead; tapping it opens MainActivity, which starts the service through a normal,
+ * user-initiated launch.
  */
 class BootReceiver : BroadcastReceiver() {
 

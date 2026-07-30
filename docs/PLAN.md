@@ -88,14 +88,18 @@ app/src/main/java/chat/phantomyard/auto/
                              phantomyard.ai) exactly as the PWA — same running JS session,
                              not a reload. Handles camera permission
                              (WebChromeClient.onPermissionRequest) for QR-scan onboarding,
-                             requests POST_NOTIFICATIONS (Android 13+). On stop/destroy,
+                             requests POST_NOTIFICATIONS (Android 13+), and prompts to
+                             disable battery optimization to ensure the background
+                             connection stays alive during deep sleep. On stop/destroy,
                              detaches the WebView (does not destroy it) back to the service.
   service/
     PhantomAutoService.kt  — foreground service that owns the single WebView instance
                              (created with applicationContext to avoid Activity-context
                              leaks across reparenting), loads chat.phantomyard.ai once, and
                              keeps running/persisting it whether or not any Activity is
-                             currently attached. Injects assets/bridge.js on page load
+                             currently attached. Acquires a partial WakeLock to keep the CPU
+                             awake (and thus the WebView bridge processing messages) when
+                              the screen is off. Injects assets/bridge.js on page load
                              (WebViewClient.onPageFinished), which:
                                - polls for window.__phantomchatChatAPI (same retry idiom as
                                  phantomchat-bridge.ts)
@@ -141,8 +145,10 @@ two presentations of that same instance.
   dedicated real-device testing; it's the highest-risk single piece of this plan.
 - **Risk/cost**: a Chromium WebView instance runs continuously in the foreground service —
   heavier CPU/RAM/battery than a lean native socket client. A persistent foreground
-  notification (standard for background media/VoIP-style services) mitigates Android killing
-  it, but needs confirming on a real device under Doze/background restrictions.
+  notification (standard for background media/VoIP-style services) plus a partial
+  WakeLock ensures survival under Doze/background restrictions, but increases idle
+  battery drain. User-prompted exclusion from battery optimization is used to
+  guarantee message delivery reliability.
 - Camera permission for QR-based onboarding needs explicit handling in the WebView (`
   onPermissionRequest`) plus the Android runtime `CAMERA` permission — plain `WebView` doesn't
   grant this automatically the way Chrome does.

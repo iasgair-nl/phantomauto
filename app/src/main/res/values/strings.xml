@@ -8,4 +8,7 @@
     <string name="me_label">You</string>
     <string name="boot_prompt_channel_name">PhantomChat reconnect</string>
     <string name="boot_prompt_title">Tap to reconnect PhantomChat</string>
+    <string name="battery_optimization_title">Keep connection alive</string>
+    <string name="battery_optimization_message">Android might disconnect PhantomChat to save battery. To ensure reliable messaging, please set battery usage to \"Unrestricted\" for this app.</string>
+    <string name="battery_optimization_button">Settings</string>
 </resources>
