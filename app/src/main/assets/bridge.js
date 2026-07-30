@@ -148,6 +148,28 @@
       var ownId = chatApi.getOwnId();
       var parts = String(conversationId).split(':');
       var peerPubkey = parts[0] === ownId ? parts[1] : parts[0];
+
+      // chatApi.sendText() alone (used below as a fallback) publishes to the relay -
+      // the recipient gets the message fine - but it skips both local persistence
+      // and the live bubble-render dispatch: those only happen inside the real UI's
+      // RPC handler (virtual-mtproto-server.ts messages.sendMessage), which the
+      // app's own chat input calls via window.rootScope.managers.appMessagesManager
+      // (see src/components/chat/input.ts) rather than calling chatApi.sendText
+      // directly. Go through that same path so a reply sent from Android Auto/a
+      // notification shows up in the app exactly like one sent from the UI.
+      var rs = window.rootScope;
+      var bridge = window.__phantomchatBridgeInstance;
+      if (rs && rs.managers && rs.managers.appMessagesManager && bridge && bridge.mapPubkeyToPeerId) {
+        return bridge.mapPubkeyToPeerId(peerPubkey).then(function (peerId) {
+          return rs.managers.appMessagesManager.sendText({peerId: peerId, text: text});
+        }).then(function () {
+          return true;
+        });
+      }
+
+      // Fallback: still delivers the message over the relay even if the
+      // UI-equivalent path isn't available for some reason, just without local
+      // persistence/rendering.
       chatApi.setActivePeer(peerPubkey);
       return chatApi.sendText(text);
     };
