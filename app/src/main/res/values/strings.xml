@@ -11,4 +11,7 @@
     <string name="battery_optimization_title">Keep connection alive</string>
     <string name="battery_optimization_message">Android might disconnect PhantomChat to save battery. To ensure reliable messaging, please set battery usage to \"Unrestricted\" for this app.</string>
     <string name="battery_optimization_button">Settings</string>
+    <string name="overlay_permission_title">Keep connection alive (Part 2)</string>
+    <string name="overlay_permission_message">To stay connected while your phone is locked, PhantomAuto needs to remain \"visible\" to the system. Please allow \"Draw over other apps\" for this app.</string>
+    <string name="overlay_permission_button">Allow</string>
 </resources>

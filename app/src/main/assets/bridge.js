@@ -15,6 +15,26 @@
   }
   window.__phantomAutoBridgeInstalled = true;
 
+  // Global error handlers to capture PWA crashes that might cause a white screen.
+  window.addEventListener('unhandledrejection', function(event) {
+    console.error('[BRIDGE] Unhandled promise rejection:', event.reason);
+  });
+  window.addEventListener('error', function(event) {
+    console.error('[BRIDGE] Global error:', event.message, 'at', event.filename, ':', event.lineno);
+  });
+
+  // Polyfill for the Notification API, which is missing in Android WebView.
+  // Prevents crashes when the web app tries to show browser notifications.
+  if (!window.Notification) {
+    window.Notification = function(title, options) {
+      console.log("Notification polyfill suppressed:", title, options);
+    };
+    window.Notification.permission = 'granted';
+    window.Notification.requestPermission = function() {
+      return Promise.resolve('granted');
+    };
+  }
+
   var ATTACH_RETRY_MS = 300;
 
   function post(type, payload) {
@@ -98,6 +118,22 @@
     // (one line, stable, documented format) rather than reaching into the
     // module's internals to build it.
     return [pubkeyA, pubkeyB].sort().join(':');
+  }
+
+  // Silent audio loop to prevent Chromium from throttling JS timers in the background
+  // (the "5-minute rule"). Requires mediaPlaybackRequiresUserGesture = false in native.
+  function startSilentAudio() {
+    var audio = document.createElement('audio');
+    audio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAIlYAAClWAAACABAAZGF0YQAAAAA=';
+    audio.loop = true;
+    audio.play().catch(function (e) {
+      console.warn("Silent audio nudge failed:", e);
+    });
+
+    // Also periodic manual trigger of 'online' to force internal re-checks.
+    setInterval(function() {
+      window.dispatchEvent(new Event('online'));
+    }, 30000);
   }
 
   function toBridgeMessage(chatApi, msg) {
@@ -211,6 +247,10 @@
   }
 
   function attach() {
+    // Start the silent audio loop immediately to prevent throttling even before
+    // ChatAPI is fully loaded/attached.
+    startSilentAudio();
+
     // This is a single-page app loaded exactly once for the WebView's entire
     // lifetime (see PhantomAutoService), so onPageFinished - and this poll -
     // only ever runs once per process. Identity creation/import or a PIN

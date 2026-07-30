@@ -10,14 +10,24 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
+import android.view.Gravity
 import android.view.ViewGroup
+import android.view.WindowManager
+import android.webkit.ConsoleMessage
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.core.app.NotificationCompat
@@ -52,6 +62,19 @@ class PhantomAutoService : Service() {
     private val binder = LocalBinder()
     private var webView: WebView? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var isOverlayAttached = false
+
+    private val keepAliveHandler = Handler(Looper.getMainLooper())
+    private val keepAliveRunnable = object : Runnable {
+        override fun run() {
+            // A minuscule "nudge" to the JavaScript engine every 30 seconds ensures Chromium
+            // doesn't freeze the JS runtime while the screen is off/app is backgrounded.
+            // We also trigger an 'online' event to force Nostr clients to re-check relays.
+            webView?.evaluateJavascript("window.dispatchEvent(new Event('online')); void 0;", null)
+            keepAliveHandler.postDelayed(this, 30_000)
+        }
+    }
 
     // Context (needed for getString) isn't attached yet when property initializers run,
     // so this must stay lazy rather than eagerly built.
@@ -79,6 +102,8 @@ class PhantomAutoService : Service() {
         instance = this
         createNotificationChannels()
         acquireWakeLock()
+        acquireWifiLock()
+        startKeepAlive()
         ServiceCompat.startForeground(
             this,
             CONNECTION_NOTIFICATION_ID,
@@ -97,31 +122,130 @@ class PhantomAutoService : Service() {
 
     /** The single, always-running WebView, created lazily on first access. */
     fun getWebView(): WebView {
-        return webView ?: createWebView().also { webView = it }
+        return (webView ?: createWebView().also { webView = it }).also {
+            detachFromOverlay()
+        }
     }
 
     /** Detach the WebView from whatever ViewGroup currently holds it, if any. */
     fun detachWebViewFromParent() {
         val view = webView ?: return
         (view.parent as? ViewGroup)?.removeView(view)
+        attachToOverlayIfPossible()
+    }
+
+    /** Force the WebView to reload the PWA URL. */
+    fun reloadWebView() {
+        webView?.loadUrl(PHANTOM_CHAT_URL)
+    }
+
+    private fun attachToOverlayIfPossible() {
+        if (isOverlayAttached || !Settings.canDrawOverlays(this)) return
+        val view = webView ?: return
+
+        try {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val params = WindowManager.LayoutParams(
+                2, 2, // 2x2 pixels to ensure the GPU doesn't discard the layer
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = 0
+                y = 0
+                alpha = 0.01f // Almost invisible, but enough to stay "real" to the compositor
+            }
+            wm.addView(view, params)
+            isOverlayAttached = true
+            Log.d(TAG, "WebView attached to 1x1 overlay")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to attach WebView to overlay", e)
+        }
+    }
+
+    private fun detachFromOverlay() {
+        if (!isOverlayAttached) return
+        val view = webView ?: return
+        try {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            // Use removeViewImmediate to force the window manager to release the token
+            // and view state right now, preventing graphical deadlocks during re-attachment.
+            wm.removeViewImmediate(view)
+            isOverlayAttached = false
+            Log.d(TAG, "WebView detached from overlay (immediate)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to detach WebView from overlay", e)
+        }
     }
 
     private fun createWebView(): WebView {
         val view = WebView(applicationContext)
+        view.setBackgroundColor(Color.BLACK)
         view.settings.javaScriptEnabled = true
         view.settings.domStorageEnabled = true
+        view.settings.databaseEnabled = true
+        view.settings.mediaPlaybackRequiresUserGesture = false
+        view.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        // Force internal network state to 'available' to discourage Chromium from
+        // aggressively cutting off background connections.
+        view.setNetworkAvailable(true)
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+
         view.addJavascriptInterface(
             AndroidBridgeInterface { rawJson -> handleBridgePayload(rawJson) },
             "AndroidBridge"
         )
         view.webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                Log.d(TAG, "Page started loading: $url")
+                // Inject polyfills as early as possible to prevent boot-time crashes.
+                view?.evaluateJavascript(loadBridgeScript(), null)
+            }
+
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                Log.d(TAG, "Page finished loading: $url")
+                // Re-inject in case it didn't take or page was replaced.
                 view?.evaluateJavascript(loadBridgeScript(), null)
+            }
+
+            override fun onReceivedError(view: WebView?, request: android.webkit.WebResourceRequest?, error: android.webkit.WebResourceError?) {
+                Log.e(TAG, "WebView Error: ${error?.description} (${error?.errorCode}) for URL: ${request?.url}")
+            }
+
+            override fun onReceivedHttpError(view: WebView?, request: android.webkit.WebResourceRequest?, errorResponse: android.webkit.WebResourceResponse?) {
+                Log.e(TAG, "HTTP Error: ${errorResponse?.statusCode} for URL: ${request?.url}")
+            }
+
+            override fun onReceivedSslError(view: WebView?, handler: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) {
+                Log.e(TAG, "SSL Error: $error")
+                handler?.cancel() // Safety first, but logging helps debug.
+            }
+
+            override fun onRenderProcessGone(view: WebView?, detail: android.webkit.RenderProcessGoneDetail?): Boolean {
+                Log.e(TAG, "WebView render process gone! Crashed=${detail?.didCrash()}")
+                // If the renderer is gone, we must destroy the old view and start fresh.
+                // The service stays alive, but the PhantomChat session is lost.
+                webView?.let {
+                    (it.parent as? ViewGroup)?.removeView(it)
+                    it.destroy()
+                }
+                webView = null
+                // Attempt to recover by creating a new one on next access
+                return true
             }
         }
         view.webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                Log.d("WebViewConsole", "[${consoleMessage?.messageLevel()}] ${consoleMessage?.message()} " +
+                    "(${consoleMessage?.sourceId()}:${consoleMessage?.lineNumber()})")
+                return true
+            }
+
             // The web content's QR-scan onboarding calls getUserMedia() for the camera.
             // The OS runtime permission itself can only be requested from an Activity
             // (MainActivity does this on launch) - this just mirrors that grant into the
@@ -362,6 +486,33 @@ class PhantomAutoService : Service() {
         wakeLock = null
     }
 
+    private fun acquireWifiLock() {
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        wifiLock = wifiManager.createWifiLock(
+            WifiManager.WIFI_MODE_FULL,
+            "PhantomAuto::WifiLock"
+        ).also {
+            it.acquire()
+        }
+    }
+
+    private fun releaseWifiLock() {
+        wifiLock?.let {
+            if (it.isHeld) {
+                it.release()
+            }
+        }
+        wifiLock = null
+    }
+
+    private fun startKeepAlive() {
+        keepAliveHandler.postDelayed(keepAliveRunnable, 30_000)
+    }
+
+    private fun stopKeepAlive() {
+        keepAliveHandler.removeCallbacks(keepAliveRunnable)
+    }
+
     private fun buildConnectionNotification(): Notification {
         val openAppIntent = Intent(this, MainActivity::class.java)
         val contentIntent = PendingIntent.getActivity(
@@ -379,6 +530,9 @@ class PhantomAutoService : Service() {
 
     override fun onDestroy() {
         instance = null
+        stopKeepAlive()
+        detachFromOverlay()
+        releaseWifiLock()
         releaseWakeLock()
         webView?.destroy()
         webView = null

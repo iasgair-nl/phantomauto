@@ -89,18 +89,30 @@ app/src/main/java/chat/phantomyard/auto/
                              not a reload. Handles camera permission
                              (WebChromeClient.onPermissionRequest) for QR-scan onboarding,
                              requests POST_NOTIFICATIONS (Android 13+), and prompts to
-                             disable battery optimization to ensure the background
-                             connection stays alive during deep sleep. On stop/destroy,
-                             detaches the WebView (does not destroy it) back to the service.
+                             disable battery optimization and allow "Draw over other apps"
+                             (overlay) to ensure the background connection stays alive
+                             during deep sleep. Implements a graphical reset (GPU buffer
+                             flush via hardware acceleration toggle) to ensure the UI
+                             re-renders correctly when opening from a background state.
+                             On stop/destroy, detaches the WebView back to the service.
   service/
     PhantomAutoService.kt  — foreground service that owns the single WebView instance
                              (created with applicationContext to avoid Activity-context
                              leaks across reparenting), loads chat.phantomyard.ai once, and
                              keeps running/persisting it whether or not any Activity is
-                             currently attached. Acquires a partial WakeLock to keep the CPU
-                             awake (and thus the WebView bridge processing messages) when
-                              the screen is off. Injects assets/bridge.js on page load
-                             (WebViewClient.onPageFinished), which:
+                             currently attached. Acquires a partial WakeLock and WifiLock
+                             to keep the CPU and network awake. When backgrounded, attaches
+                             the WebView to a persistent 2x2 pixel invisible overlay
+                             (SYSTEM_ALERT_WINDOW) to keep the renderer process active.
+                             Injects assets/bridge.js on page load, which:
+                               - polls for window.__phantomchatChatAPI
+                               - wraps chatApi.onMessage to forward DMs to Android
+                               - defines window.sendReply and window.getConversationsSnapshot
+                               - runs a "Silent Audio" loop to prevent Chromium from
+                                 throttling JS timers (the "5-minute rule")
+                               - polyfills window.Notification to prevent web-app crashes
+                               - periodically triggers 'online' events to force socket checks
+                             Uses removeViewImmediate() for clean window-token transitions.
                                - polls for window.__phantomchatChatAPI (same retry idiom as
                                  phantomchat-bridge.ts)
                                - wraps (not overwrites) chatApi.onMessage to also call
@@ -145,10 +157,11 @@ two presentations of that same instance.
   dedicated real-device testing; it's the highest-risk single piece of this plan.
 - **Risk/cost**: a Chromium WebView instance runs continuously in the foreground service —
   heavier CPU/RAM/battery than a lean native socket client. A persistent foreground
-  notification (standard for background media/VoIP-style services) plus a partial
-  WakeLock ensures survival under Doze/background restrictions, but increases idle
-  battery drain. User-prompted exclusion from battery optimization is used to
-  guarantee message delivery reliability.
+  notification, a partial WakeLock/WifiLock, an invisible overlay, and a silent audio loop
+  collectively ensure survival under Doze/background restrictions and bypass Chromium
+  intensive throttling, but increase idle battery drain. User-prompted exclusion from
+  battery optimization and overlay permission are used to guarantee message delivery
+  reliability and UI stability.
 - Camera permission for QR-based onboarding needs explicit handling in the WebView (`
   onPermissionRequest`) plus the Android runtime `CAMERA` permission — plain `WebView` doesn't
   grant this automatically the way Chrome does.
