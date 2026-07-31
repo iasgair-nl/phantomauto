@@ -6,17 +6,25 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.SurfaceTexture
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
+import android.view.Surface
+import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.ConsoleMessage
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
@@ -87,9 +95,36 @@ class PhantomAutoService : Service() {
 
     private val binder = LocalBinder()
     private var webView: WebView? = null
+    private var ghostDisplay: VirtualDisplay? = null
+    private var ghostSurfaceTexture: SurfaceTexture? = null
+    private var ghostWindowManager: WindowManager? = null
 
     private val tickHandler = Handler(Looper.getMainLooper())
     @Volatile private var engagedViaAndroidAuto = false
+
+    /**
+     * Whether the MainActivity is currently in the foreground (hosting the WebView).
+     * Notifications are gated when the user is actively looking at the app.
+     */
+    var isActivityVisible: Boolean = false
+        set(value) {
+            if (field != value) {
+                Log.d(TAG, "activity visible=$value")
+                field = value
+                if (value) {
+                    clearGenericNotifications()
+                }
+            }
+        }
+
+    private fun clearGenericNotifications() {
+        val manager = NotificationManagerCompat.from(this)
+        pendingGenericNotification?.let { tickHandler.removeCallbacks(it) }
+        pendingGenericNotification = null
+        messagingStyles.remove(GENERIC_ALERT_CONVERSATION_ID)
+        manager.cancel(GENERIC_ALERT_CONVERSATION_ID.hashCode())
+    }
+
     private lateinit var carConnection: CarConnection
     private val carConnectionObserver = Observer<Int> { type ->
         val nowEngaged = type == CarConnection.CONNECTION_TYPE_PROJECTION ||
@@ -108,10 +143,35 @@ class PhantomAutoService : Service() {
         override fun run() {
             val interval = if (engagedViaAndroidAuto) ENGAGED_TICK_INTERVAL_MS else IDLE_TICK_INTERVAL_MS
             Log.d(TAG, "resume tick (engaged=$engagedViaAndroidAuto, next in ${interval}ms)")
-            webView?.resumeTimers()
-            webView?.evaluateJavascript("window.dispatchEvent(new Event('online')); void 0;", null)
+            wakeWebView()
             tickHandler.postDelayed(this, interval)
         }
+    }
+
+    private fun wakeWebView() {
+        val view = webView ?: return
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+
+        // Chromium background throttling is notoriously hard to bypass.
+        // We simulate a full visibility and focus cycle to trick the engine
+        // into thinking it's actively rendering on a real window.
+        view.onResume()
+        view.resumeTimers()
+        view.setNetworkAvailable(true)
+        
+        view.visibility = View.VISIBLE
+        view.dispatchWindowVisibilityChanged(View.VISIBLE)
+        view.dispatchWindowFocusChanged(true)
+
+        view.measure(
+            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
+        )
+        view.layout(0, 0, width, height)
+        view.requestLayout()
+        view.evaluateJavascript("window.dispatchEvent(new Event('online')); void 0;", null)
     }
 
     // Context (needed for getString) isn't attached yet when property initializers run,
@@ -149,6 +209,7 @@ class PhantomAutoService : Service() {
             buildConnectionNotification(),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
         )
+        setupGhostWindow()
         carConnection = CarConnection(applicationContext)
         carConnection.type.observeForever(carConnectionObserver)
         tickHandler.post(tickRunnable)
@@ -164,13 +225,78 @@ class PhantomAutoService : Service() {
 
     /** The single, always-running WebView, created lazily on first access. */
     fun getWebView(): WebView {
-        return webView ?: createWebView().also { webView = it }
+        val view = webView ?: createWebView().also { webView = it }
+        // Ensure it's removed from any previous parent (Activity or Ghost Window)
+        removeFromParent(view)
+        return view
     }
 
-    /** Detach the WebView from whatever ViewGroup currently holds it, if any. */
-    fun detachWebViewFromParent() {
+    private fun removeFromParent(view: View) {
+        val parent = view.parent ?: return
+        if (parent is ViewGroup) {
+            parent.removeView(view)
+        } else {
+            // If it's attached to a WindowManager (like our ghost window), 
+            // view.parent will be a ViewRootImpl, not a ViewGroup.
+            try {
+                ghostWindowManager?.removeViewImmediate(view)
+            } catch (e: Exception) {
+                // Not attached to this WM or already detached
+            }
+        }
+    }
+
+    /** 
+     * Moves the WebView to a headless ghost window so it stays attached to a Window context
+     * and keeps its JS/network stack alive even when the phone app is closed.
+     */
+    fun moveWebViewToBackground() {
         val view = webView ?: return
-        (view.parent as? ViewGroup)?.removeView(view)
+        val wm = ghostWindowManager ?: return
+        
+        // Remove from current parent (e.g. MainActivity)
+        removeFromParent(view)
+        
+        // Attach to our invisible ghost window
+        val metrics = resources.displayMetrics
+        val params = WindowManager.LayoutParams(
+            metrics.widthPixels,
+            metrics.heightPixels,
+            WindowManager.LayoutParams.TYPE_PRIVATE_PRESENTATION,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        try {
+            wm.addView(view, params)
+            Log.d(TAG, "WebView moved to ghost window")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to attach WebView to ghost window", e)
+        }
+    }
+
+    private fun setupGhostWindow() {
+        try {
+            val dm = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+            val metrics = resources.displayMetrics
+            val width = metrics.widthPixels
+            val height = metrics.heightPixels
+            
+            // Create a dummy surface for the virtual display
+            val surfaceTexture = SurfaceTexture(10)
+            ghostSurfaceTexture = surfaceTexture
+            val surface = Surface(surfaceTexture)
+            
+            ghostDisplay = dm.createVirtualDisplay(
+                "PhantomGhostDisplay", width, height, metrics.densityDpi,
+                surface, 0
+            )
+            
+            val displayContext = createDisplayContext(ghostDisplay!!.display)
+            ghostWindowManager = displayContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            Log.d(TAG, "Ghost window system initialized")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to setup ghost window", e)
+        }
     }
 
     /** Force the WebView to reload the PWA URL. */
@@ -315,8 +441,12 @@ class PhantomAutoService : Service() {
      * showIncomingMessageNotification if the real, decrypted message beats it there.
      */
     private fun onGiftWrapWake(eventId: String) {
-        webView?.resumeTimers()
-        webView?.evaluateJavascript("window.dispatchEvent(new Event('online')); void 0;", null)
+        wakeWebView()
+
+        // Only show notifications if engaged via Android Auto and the app isn't active.
+        if (!engagedViaAndroidAuto || isActivityVisible) {
+            return
+        }
 
         // Arm the fallback only if nothing is already pending, so a burst of several
         // gift-wrap events (e.g. multi-relay fanout, or unrelated kind-1059 traffic
@@ -374,6 +504,13 @@ class PhantomAutoService : Service() {
         pendingGenericNotification = null
         messagingStyles.remove(GENERIC_ALERT_CONVERSATION_ID)
         NotificationManagerCompat.from(this).cancel(GENERIC_ALERT_CONVERSATION_ID.hashCode())
+
+        // Only show notifications if engaged via Android Auto and the app isn't active.
+        if (!engagedViaAndroidAuto || isActivityVisible) {
+            Log.d(TAG, "suppressing notification: AA=$engagedViaAndroidAuto, visible=$isActivityVisible")
+            return
+        }
+
         val senderName = payload.optString("senderName", "PhantomChat")
         val peerPubkey = payload.optString("peerPubkey", conversationId)
         val timestamp = payload.optLong("timestamp", System.currentTimeMillis())
@@ -410,6 +547,10 @@ class PhantomAutoService : Service() {
         val style = messagingStyleFor(conversationId, senderName)
         style.addMessage(text, System.currentTimeMillis(), null as Person?)
         notify(conversationId, style)
+
+        // Chromium often freezes the JS engine/network stack when the WebView is detached.
+        // Force a wake-up before sending the reply to ensure it hits the wire immediately.
+        wakeWebView()
 
         val script = buildSendReplyScript(conversationId, text)
         webView?.evaluateJavascript(script, null)
@@ -505,7 +646,10 @@ class PhantomAutoService : Service() {
             .setShortcutId(conversationId)
             .build()
 
-        NotificationManagerCompat.from(this).notify(notificationId, notification)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) 
+            == PackageManager.PERMISSION_GRANTED) {
+            NotificationManagerCompat.from(this).notify(notificationId, notification)
+        }
     }
 
     /** Invoked by MarkReadReceiver - Android Auto (and other surfaces) may fire the
@@ -574,8 +718,19 @@ class PhantomAutoService : Service() {
         carConnection.type.removeObserver(carConnectionObserver)
         relayWakeListener?.stop()
         relayWakeListener = null
-        webView?.destroy()
+        
+        webView?.let {
+            (it.parent as? ViewGroup)?.removeView(it)
+            it.destroy()
+        }
         webView = null
+        
+        ghostDisplay?.release()
+        ghostDisplay = null
+        ghostSurfaceTexture?.release()
+        ghostSurfaceTexture = null
+        ghostWindowManager = null
+        
         super.onDestroy()
     }
 

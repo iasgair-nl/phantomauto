@@ -14,6 +14,7 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -46,6 +47,7 @@ class MainActivity : AppCompatActivity() {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val bound = (binder as PhantomAutoService.LocalBinder).getService()
             service = bound
+            service?.isActivityVisible = true
             attachWebView(bound)
         }
 
@@ -55,6 +57,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         container = FrameLayout(this)
         // Add a long-press listener to the container as a "secret" way to reload
@@ -64,11 +67,6 @@ class MainActivity : AppCompatActivity() {
             true
         }
         setContentView(container)
-        // Apps targeting API 35+ get edge-to-edge enforced with no opt-out - content draws
-        // behind the status/nav bars by default. PhantomChat's own top nav (rendered inside
-        // the WebView) would end up under the status bar, where taps land on the system bar
-        // instead of the page. Pad the container by the system bar insets to keep the WebView
-        // clear of them, same as pre-edge-to-edge layout looked.
         ViewCompat.setOnApplyWindowInsetsListener(container) { view, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             view.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
@@ -121,12 +119,13 @@ class MainActivity : AppCompatActivity() {
         }
         bindService(intent, connection, Context.BIND_AUTO_CREATE)
         bound = true
+        service?.isActivityVisible = true
     }
 
     override fun onStop() {
         super.onStop()
-        service?.detachWebViewFromParent()
-        container.removeAllViews()
+        service?.isActivityVisible = false
+        service?.moveWebViewToBackground()
         if (bound) {
             unbindService(connection)
             bound = false
@@ -136,7 +135,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun attachWebView(service: PhantomAutoService) {
         val webView = service.getWebView()
-        (webView.parent as? ViewGroup)?.removeView(webView)
         container.addView(
             webView,
             ViewGroup.LayoutParams.MATCH_PARENT,
