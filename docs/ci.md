@@ -4,19 +4,26 @@
 
 | Workflow | Trigger | Doet |
 |---|---|---|
-| `.github/workflows/ci.yml` | push/PR op `development` + `main`, manueel | JDK 21 (temurin), Gradle cache, `assembleDebug`, `test`, `lint`. Uploadt debug-APK + lint-rapport als artifacts. |
-| `.github/workflows/release.yml` | tag `v*`, of manueel met tag-input | `assembleRelease`, signt de APK en publiceert een GitHub Release met de APK erbij. |
+| `.github/workflows/ci.yml` | push/PR op `development`, `main`, `release`, manueel | JDK 21 (temurin), Gradle cache, `assembleDebug`, `test`, `lint`. Uploadt debug-APK + lint-rapport als artifacts. |
+| `.github/workflows/release.yml` | push op `release` (of manueel) | `assembleRelease`, signt de APK en publiceert een GitHub Release met de APK erbij. |
 
 Beide draaien op GitHub-hosted `ubuntu-latest`.
 
 ## Release maken
 
+Een release ontstaat alleen door code naar de `release`-branch te brengen:
+
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+# 1. bump versionName in app/build.gradle.kts (bv. 0.1.0 -> 0.2.0)
+# 2. merge development -> release via een PR
 ```
 
-De workflow bouwt `phantomauto-v0.1.0.apk` en hangt die aan de Release.
+Zodra er op `release` gepusht wordt, leest de workflow `versionName` uit
+`app/build.gradle.kts`, maakt de tag `v<versionName>` aan, bouwt
+`phantomauto-v<versionName>.apk` en publiceert die als GitHub Release.
+
+Bestaat die tag al, dan doet de workflow niets (geen dubbele release).
+Bump dus `versionName` voor elke nieuwe release.
 
 ## Signing secrets
 
