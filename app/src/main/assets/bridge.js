@@ -120,22 +120,6 @@
     return [pubkeyA, pubkeyB].sort().join(':');
   }
 
-  // Silent audio loop to prevent Chromium from throttling JS timers in the background
-  // (the "5-minute rule"). Requires mediaPlaybackRequiresUserGesture = false in native.
-  function startSilentAudio() {
-    var audio = document.createElement('audio');
-    audio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAIlYAAClWAAACABAAZGF0YQAAAAA=';
-    audio.loop = true;
-    audio.play().catch(function (e) {
-      console.warn("Silent audio nudge failed:", e);
-    });
-
-    // Also periodic manual trigger of 'online' to force internal re-checks.
-    setInterval(function() {
-      window.dispatchEvent(new Event('online'));
-    }, 30000);
-  }
-
   function toBridgeMessage(chatApi, msg) {
     var ownId = chatApi.getOwnId();
     var peerPubkey = msg.from === ownId ? msg.to : msg.from;
@@ -243,14 +227,17 @@
       });
     };
 
-    post('ready', {ownId: chatApi.getOwnId()});
+    // relays: read straight from the pool's own current config (getRelays() is
+    // synchronous, no promise) so the native wake-listener always mirrors whatever
+    // relays this account is actually using, rather than a native-side guess.
+    var pool = window.__phantomchatPool;
+    var relays = (pool && typeof pool.getRelays === 'function')
+      ? pool.getRelays().map(function (r) { return r.url; })
+      : [];
+    post('ready', {ownId: chatApi.getOwnId(), relays: relays});
   }
 
   function attach() {
-    // Start the silent audio loop immediately to prevent throttling even before
-    // ChatAPI is fully loaded/attached.
-    startSilentAudio();
-
     // This is a single-page app loaded exactly once for the WebView's entire
     // lifetime (see PhantomAutoService), so onPageFinished - and this poll -
     // only ever runs once per process. Identity creation/import or a PIN

@@ -12,9 +12,9 @@ import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
-import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -47,6 +47,7 @@ class MainActivity : AppCompatActivity() {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val bound = (binder as PhantomAutoService.LocalBinder).getService()
             service = bound
+            service?.isActivityVisible = true
             attachWebView(bound)
         }
 
@@ -56,6 +57,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         container = FrameLayout(this)
         // Add a long-press listener to the container as a "secret" way to reload
@@ -65,11 +67,6 @@ class MainActivity : AppCompatActivity() {
             true
         }
         setContentView(container)
-        // Apps targeting API 35+ get edge-to-edge enforced with no opt-out - content draws
-        // behind the status/nav bars by default. PhantomChat's own top nav (rendered inside
-        // the WebView) would end up under the status bar, where taps land on the system bar
-        // instead of the page. Pad the container by the system bar insets to keep the WebView
-        // clear of them, same as pre-edge-to-edge layout looked.
         ViewCompat.setOnApplyWindowInsetsListener(container) { view, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             view.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
@@ -77,7 +74,6 @@ class MainActivity : AppCompatActivity() {
         }
         requestNeededPermissions()
         checkBatteryOptimization()
-        checkOverlayPermission()
     }
 
     private fun checkBatteryOptimization() {
@@ -92,25 +88,6 @@ class MainActivity : AppCompatActivity() {
                         val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
                             data = Uri.parse("package:$packageName")
                         }
-                        startActivity(intent)
-                    }
-                    .setNegativeButton(android.R.string.cancel, null)
-                    .show()
-            }
-        }
-    }
-
-    private fun checkOverlayPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (!Settings.canDrawOverlays(this)) {
-                AlertDialog.Builder(this)
-                    .setTitle(R.string.overlay_permission_title)
-                    .setMessage(R.string.overlay_permission_message)
-                    .setPositiveButton(R.string.overlay_permission_button) { _, _ ->
-                        val intent = Intent(
-                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                            Uri.parse("package:$packageName")
-                        )
                         startActivity(intent)
                     }
                     .setNegativeButton(android.R.string.cancel, null)
@@ -142,12 +119,13 @@ class MainActivity : AppCompatActivity() {
         }
         bindService(intent, connection, Context.BIND_AUTO_CREATE)
         bound = true
+        service?.isActivityVisible = true
     }
 
     override fun onStop() {
         super.onStop()
-        service?.detachWebViewFromParent()
-        container.removeAllViews()
+        service?.isActivityVisible = false
+        service?.moveWebViewToBackground()
         if (bound) {
             unbindService(connection)
             bound = false
@@ -157,37 +135,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun attachWebView(service: PhantomAutoService) {
         val webView = service.getWebView()
-        (webView.parent as? ViewGroup)?.removeView(webView)
-
-        // Clear any old, potentially stuck views before adding the fresh/recovered one.
-        container.removeAllViews()
-
-        // Hard-reset the graphical pipeline. Temporarily disabling hardware 
-        // acceleration forces the system to discard existing GPU buffers 
-        // that might be stuck in the 1x1 overlay state.
-        container.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
-        webView.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
-        webView.visibility = View.GONE
-
         container.addView(
             webView,
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         )
-
-        // Give the window manager a moment to settle the new view hierarchy
-        // before flipping hardware acceleration back on.
-        webView.postDelayed({
-            webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-            container.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-            
-            webView.visibility = View.VISIBLE
-            webView.onResume()
-            webView.requestLayout()
-            webView.invalidate()
-            
-            // Trigger a JS resize event to force the PWA's own layout logic to re-evaluate.
-            webView.evaluateJavascript("window.dispatchEvent(new Event('resize'));", null)
-        }, 100)
     }
 }

@@ -12,16 +12,17 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
-import android.net.wifi.WifiManager
+import android.graphics.SurfaceTexture
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.PowerManager
-import android.provider.Settings
 import android.util.Log
-import android.view.Gravity
+import android.view.Surface
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.ConsoleMessage
@@ -30,6 +31,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.car.app.connection.CarConnection
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
@@ -39,6 +41,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
 import androidx.core.graphics.drawable.IconCompat
+import androidx.lifecycle.Observer
 import chat.phantomyard.auto.BuildConfig
 import chat.phantomyard.auto.MainActivity
 import chat.phantomyard.auto.R
@@ -51,6 +54,37 @@ private const val CONNECTION_CHANNEL_ID = "phantomauto_connection"
 private const val CONNECTION_NOTIFICATION_ID = 1
 private const val MESSAGE_CHANNEL_ID = "phantomauto_messages"
 
+// Chromium throttles a backgrounded WebView's own JS timers (the "5-minute rule"),
+// independent of the process/Doze-level exemptions a remoteMessaging foreground
+// service already gets - confirmed by real-world testing: messages stop arriving
+// a few minutes after screen-off even with the service alive. A tick driven from
+// the Kotlin side (unaffected by that JS-timer throttling) dispatches the same
+// 'online' event PhantomChat's own relay pool already listens to for resuming
+// (nostr-relay-pool.ts), just at a sane interval instead of the previous
+// unconditional 30s spam - fast while actively driving (when timely delivery
+// matters most), backed off aggressively otherwise (when it doesn't).
+private const val ENGAGED_TICK_INTERVAL_MS = 60_000L // 1 minute, while connected to Android Auto
+private const val IDLE_TICK_INTERVAL_MS = 12 * 60_000L // 12 minutes, otherwise
+
+// Grace period between a raw gift-wrap event being detected (via RelayWakeListener,
+// before decryption) and falling back to a content-free alert - gives the WebView a
+// chance to wake on its own and deliver the real, decrypted MessagingStyle
+// notification first, so the fallback only fires when that doesn't happen in time.
+private const val GENERIC_NOTIFICATION_FALLBACK_DELAY_MS = 5_000L
+// NIP-17 gift-wraps the same logical message separately per relay (each copy gets its
+// own random wrapper/id for privacy), so one message can trigger several detections
+// spaced well beyond GENERIC_NOTIFICATION_FALLBACK_DELAY_MS apart - confirmed live via
+// DHU, where a single test message read the fallback alert out three times. Suppress
+// re-arming for a while after one fires so relay-fanout latency doesn't read out as
+// multiple separate alerts.
+private const val GENERIC_ALERT_SUPPRESS_WINDOW_MS = 90_000L
+// Placeholder "conversation" for the content-free fallback alert - deliberately routed
+// through the same notify()/MessagingStyle/shortcut path real conversations use, since
+// Android Auto silently drops anything that isn't shaped that way (see notify()).
+// There's no real peer behind it, so ReplyReceiver/sendReplyFromNotification must not
+// try to actually deliver a reply sent to this id.
+private const val GENERIC_ALERT_CONVERSATION_ID = "phantomauto-generic-alert"
+
 /**
  * Owns the single, long-lived WebView running the real PhantomChat PWA. MainActivity
  * reparents this WebView into its own layout while visible; it keeps running headlessly
@@ -61,19 +95,83 @@ class PhantomAutoService : Service() {
 
     private val binder = LocalBinder()
     private var webView: WebView? = null
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
-    private var isOverlayAttached = false
+    private var ghostDisplay: VirtualDisplay? = null
+    private var ghostSurfaceTexture: SurfaceTexture? = null
+    private var ghostWindowManager: WindowManager? = null
 
-    private val keepAliveHandler = Handler(Looper.getMainLooper())
-    private val keepAliveRunnable = object : Runnable {
-        override fun run() {
-            // A minuscule "nudge" to the JavaScript engine every 30 seconds ensures Chromium
-            // doesn't freeze the JS runtime while the screen is off/app is backgrounded.
-            // We also trigger an 'online' event to force Nostr clients to re-check relays.
-            webView?.evaluateJavascript("window.dispatchEvent(new Event('online')); void 0;", null)
-            keepAliveHandler.postDelayed(this, 30_000)
+    private val tickHandler = Handler(Looper.getMainLooper())
+    @Volatile private var engagedViaAndroidAuto = false
+
+    /**
+     * Whether the MainActivity is currently in the foreground (hosting the WebView).
+     * Notifications are gated when the user is actively looking at the app.
+     */
+    var isActivityVisible: Boolean = false
+        set(value) {
+            if (field != value) {
+                Log.d(TAG, "activity visible=$value")
+                field = value
+                if (value) {
+                    clearGenericNotifications()
+                }
+            }
         }
+
+    private fun clearGenericNotifications() {
+        val manager = NotificationManagerCompat.from(this)
+        pendingGenericNotification?.let { tickHandler.removeCallbacks(it) }
+        pendingGenericNotification = null
+        messagingStyles.remove(GENERIC_ALERT_CONVERSATION_ID)
+        manager.cancel(GENERIC_ALERT_CONVERSATION_ID.hashCode())
+    }
+
+    private lateinit var carConnection: CarConnection
+    private val carConnectionObserver = Observer<Int> { type ->
+        val nowEngaged = type == CarConnection.CONNECTION_TYPE_PROJECTION ||
+            type == CarConnection.CONNECTION_TYPE_NATIVE
+        Log.d(TAG, "car connection type=$type engaged=$nowEngaged")
+        if (nowEngaged != engagedViaAndroidAuto) {
+            engagedViaAndroidAuto = nowEngaged
+            // Reschedule immediately on a state change instead of waiting out whatever
+            // interval was already in flight, so switching to the fast cadence the moment
+            // a drive starts doesn't wait up to IDLE_TICK_INTERVAL_MS to kick in.
+            tickHandler.removeCallbacks(tickRunnable)
+            tickHandler.post(tickRunnable)
+        }
+    }
+    private val tickRunnable = object : Runnable {
+        override fun run() {
+            val interval = if (engagedViaAndroidAuto) ENGAGED_TICK_INTERVAL_MS else IDLE_TICK_INTERVAL_MS
+            Log.d(TAG, "resume tick (engaged=$engagedViaAndroidAuto, next in ${interval}ms)")
+            wakeWebView()
+            tickHandler.postDelayed(this, interval)
+        }
+    }
+
+    private fun wakeWebView() {
+        val view = webView ?: return
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+
+        // Chromium background throttling is notoriously hard to bypass.
+        // We simulate a full visibility and focus cycle to trick the engine
+        // into thinking it's actively rendering on a real window.
+        view.onResume()
+        view.resumeTimers()
+        view.setNetworkAvailable(true)
+        
+        view.visibility = View.VISIBLE
+        view.dispatchWindowVisibilityChanged(View.VISIBLE)
+        view.dispatchWindowFocusChanged(true)
+
+        view.measure(
+            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
+        )
+        view.layout(0, 0, width, height)
+        view.requestLayout()
+        view.evaluateJavascript("window.dispatchEvent(new Event('online')); void 0;", null)
     }
 
     // Context (needed for getString) isn't attached yet when property initializers run,
@@ -93,6 +191,10 @@ class PhantomAutoService : Service() {
     private val conversationPeerNames = mutableMapOf<String, String>()
     private val conversationPeerKeys = mutableMapOf<String, String>()
 
+    private var relayWakeListener: RelayWakeListener? = null
+    private var pendingGenericNotification: Runnable? = null
+    private var lastGenericNotificationFiredAtMs = 0L
+
     inner class LocalBinder : Binder() {
         fun getService(): PhantomAutoService = this@PhantomAutoService
     }
@@ -101,15 +203,16 @@ class PhantomAutoService : Service() {
         super.onCreate()
         instance = this
         createNotificationChannels()
-        acquireWakeLock()
-        acquireWifiLock()
-        startKeepAlive()
         ServiceCompat.startForeground(
             this,
             CONNECTION_NOTIFICATION_ID,
             buildConnectionNotification(),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
         )
+        setupGhostWindow()
+        carConnection = CarConnection(applicationContext)
+        carConnection.type.observeForever(carConnectionObserver)
+        tickHandler.post(tickRunnable)
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -122,63 +225,83 @@ class PhantomAutoService : Service() {
 
     /** The single, always-running WebView, created lazily on first access. */
     fun getWebView(): WebView {
-        return (webView ?: createWebView().also { webView = it }).also {
-            detachFromOverlay()
+        val view = webView ?: createWebView().also { webView = it }
+        // Ensure it's removed from any previous parent (Activity or Ghost Window)
+        removeFromParent(view)
+        return view
+    }
+
+    private fun removeFromParent(view: View) {
+        val parent = view.parent ?: return
+        if (parent is ViewGroup) {
+            parent.removeView(view)
+        } else {
+            // If it's attached to a WindowManager (like our ghost window), 
+            // view.parent will be a ViewRootImpl, not a ViewGroup.
+            try {
+                ghostWindowManager?.removeViewImmediate(view)
+            } catch (e: Exception) {
+                // Not attached to this WM or already detached
+            }
         }
     }
 
-    /** Detach the WebView from whatever ViewGroup currently holds it, if any. */
-    fun detachWebViewFromParent() {
+    /** 
+     * Moves the WebView to a headless ghost window so it stays attached to a Window context
+     * and keeps its JS/network stack alive even when the phone app is closed.
+     */
+    fun moveWebViewToBackground() {
         val view = webView ?: return
-        (view.parent as? ViewGroup)?.removeView(view)
-        attachToOverlayIfPossible()
+        val wm = ghostWindowManager ?: return
+        
+        // Remove from current parent (e.g. MainActivity)
+        removeFromParent(view)
+        
+        // Attach to our invisible ghost window
+        val metrics = resources.displayMetrics
+        val params = WindowManager.LayoutParams(
+            metrics.widthPixels,
+            metrics.heightPixels,
+            WindowManager.LayoutParams.TYPE_PRIVATE_PRESENTATION,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        try {
+            wm.addView(view, params)
+            Log.d(TAG, "WebView moved to ghost window")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to attach WebView to ghost window", e)
+        }
+    }
+
+    private fun setupGhostWindow() {
+        try {
+            val dm = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+            val metrics = resources.displayMetrics
+            val width = metrics.widthPixels
+            val height = metrics.heightPixels
+            
+            // Create a dummy surface for the virtual display
+            val surfaceTexture = SurfaceTexture(10)
+            ghostSurfaceTexture = surfaceTexture
+            val surface = Surface(surfaceTexture)
+            
+            ghostDisplay = dm.createVirtualDisplay(
+                "PhantomGhostDisplay", width, height, metrics.densityDpi,
+                surface, 0
+            )
+            
+            val displayContext = createDisplayContext(ghostDisplay!!.display)
+            ghostWindowManager = displayContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            Log.d(TAG, "Ghost window system initialized")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to setup ghost window", e)
+        }
     }
 
     /** Force the WebView to reload the PWA URL. */
     fun reloadWebView() {
         webView?.loadUrl(PHANTOM_CHAT_URL)
-    }
-
-    private fun attachToOverlayIfPossible() {
-        if (isOverlayAttached || !Settings.canDrawOverlays(this)) return
-        val view = webView ?: return
-
-        try {
-            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-            val params = WindowManager.LayoutParams(
-                2, 2, // 2x2 pixels to ensure the GPU doesn't discard the layer
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                x = 0
-                y = 0
-                alpha = 0.01f // Almost invisible, but enough to stay "real" to the compositor
-            }
-            wm.addView(view, params)
-            isOverlayAttached = true
-            Log.d(TAG, "WebView attached to 1x1 overlay")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to attach WebView to overlay", e)
-        }
-    }
-
-    private fun detachFromOverlay() {
-        if (!isOverlayAttached) return
-        val view = webView ?: return
-        try {
-            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-            // Use removeViewImmediate to force the window manager to release the token
-            // and view state right now, preventing graphical deadlocks during re-attachment.
-            wm.removeViewImmediate(view)
-            isOverlayAttached = false
-            Log.d(TAG, "WebView detached from overlay (immediate)")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to detach WebView from overlay", e)
-        }
     }
 
     private fun createWebView(): WebView {
@@ -193,6 +316,14 @@ class PhantomAutoService : Service() {
         // aggressively cutting off background connections.
         view.setNetworkAvailable(true)
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+        // Chromium freezes a backgrounded page's JS timer/task queue once it has no window
+        // attached for a while - confirmed live via CDP: Date.now() and sync eval kept
+        // working, but a plain setTimeout() never fired even after 75s. That queue is what
+        // PhantomChat's own reconnect/backoff/catch-up logic runs on, so relay sockets stay
+        // "connected" while nothing actually gets processed. resumeTimers() is WebView's own
+        // documented override for exactly this ("pauses/resumes JS timers for ALL WebViews"),
+        // so this isn't a hack - it's the API this situation exists for.
+        view.resumeTimers()
 
         view.addJavascriptInterface(
             AndroidBridgeInterface { rawJson -> handleBridgePayload(rawJson) },
@@ -280,7 +411,80 @@ class PhantomAutoService : Service() {
         when (type) {
             "message" -> payload?.let { showIncomingMessageNotification(it) }
             "replyResult" -> payload?.let { logReplyResult(it) }
+            "ready" -> payload?.let { startRelayWakeListener(it) }
         }
+    }
+
+    private fun startRelayWakeListener(payload: JSONObject) {
+        val ownId = payload.optString("ownId").takeIf { it.isNotEmpty() } ?: return
+        val relaysJson = payload.optJSONArray("relays")
+        val relays = mutableListOf<String>()
+        if (relaysJson != null) {
+            for (i in 0 until relaysJson.length()) {
+                relaysJson.optString(i).takeIf { it.isNotEmpty() }?.let { relays.add(it) }
+            }
+        }
+        if (relays.isEmpty()) {
+            Log.w(TAG, "no relays reported by bridge, not starting RelayWakeListener")
+            return
+        }
+        relayWakeListener?.stop()
+        relayWakeListener = RelayWakeListener(ownId, relays) { eventId -> onGiftWrapWake(eventId) }
+            .also { it.start() }
+    }
+
+    /**
+     * A gift-wrap event matching our pubkey landed on a relay - detected natively,
+     * without decrypting anything. Nudge the WebView in case it's still responsive
+     * enough to pick it up on its own, then arm a content-free fallback notification
+     * in case it isn't (see GENERIC_NOTIFICATION_FALLBACK_DELAY_MS) - cancelled by
+     * showIncomingMessageNotification if the real, decrypted message beats it there.
+     */
+    private fun onGiftWrapWake(eventId: String) {
+        wakeWebView()
+
+        // Only show notifications if engaged via Android Auto and the app isn't active.
+        if (!engagedViaAndroidAuto || isActivityVisible) {
+            return
+        }
+
+        // Arm the fallback only if nothing is already pending, so a burst of several
+        // gift-wrap events (e.g. multi-relay fanout, or unrelated kind-1059 traffic
+        // like reactions/typing) fires it a fixed delay after the FIRST one - not
+        // perpetually deferred by each subsequent detection. Also skip re-arming
+        // within GENERIC_ALERT_SUPPRESS_WINDOW_MS of the last one firing, since that's
+        // almost always the same message's slower relay copies, not a new message.
+        val sinceLastFired = System.currentTimeMillis() - lastGenericNotificationFiredAtMs
+        if (pendingGenericNotification == null && sinceLastFired > GENERIC_ALERT_SUPPRESS_WINDOW_MS) {
+            val runnable = Runnable {
+                pendingGenericNotification = null
+                lastGenericNotificationFiredAtMs = System.currentTimeMillis()
+                showGenericIncomingNotification()
+            }
+            pendingGenericNotification = runnable
+            tickHandler.postDelayed(runnable, GENERIC_NOTIFICATION_FALLBACK_DELAY_MS)
+        }
+    }
+
+    /**
+     * Content-free alert shown when a gift-wrap event was detected but the WebView
+     * didn't wake up in time to decrypt/render it - mirrors PhantomChat's own
+     * preview-level 'A' ("show generic notification, never read privkey"). Routed
+     * through the same notify()/MessagingStyle/shortcut path as a real conversation
+     * (see GENERIC_ALERT_CONVERSATION_ID) so Android Auto actually surfaces it.
+     */
+    private fun showGenericIncomingNotification() {
+        Log.d(TAG, "showing generic fallback notification (real message never arrived in time)")
+        val senderName = getString(R.string.generic_message_title)
+        conversationPeerNames[GENERIC_ALERT_CONVERSATION_ID] = senderName
+        conversationPeerKeys[GENERIC_ALERT_CONVERSATION_ID] = GENERIC_ALERT_CONVERSATION_ID
+        val style = messagingStyleFor(GENERIC_ALERT_CONVERSATION_ID, senderName)
+        style.addMessage(
+            getString(R.string.generic_message_body),
+            System.currentTimeMillis(),
+            buildPerson(senderName, GENERIC_ALERT_CONVERSATION_ID)
+        )
+        notify(GENERIC_ALERT_CONVERSATION_ID, style)
     }
 
     private fun logReplyResult(payload: JSONObject) {
@@ -294,6 +498,19 @@ class PhantomAutoService : Service() {
         val conversationId = payload.optString("conversationId").takeIf { it.isNotEmpty() } ?: return
         val text = payload.optString("text")
         if (text.isEmpty()) return
+        // Real, decrypted content made it through - no need for the generic fallback
+        // (and if it already fired, clear it so it doesn't sit alongside the real one).
+        pendingGenericNotification?.let { tickHandler.removeCallbacks(it) }
+        pendingGenericNotification = null
+        messagingStyles.remove(GENERIC_ALERT_CONVERSATION_ID)
+        NotificationManagerCompat.from(this).cancel(GENERIC_ALERT_CONVERSATION_ID.hashCode())
+
+        // Only show notifications if engaged via Android Auto and the app isn't active.
+        if (!engagedViaAndroidAuto || isActivityVisible) {
+            Log.d(TAG, "suppressing notification: AA=$engagedViaAndroidAuto, visible=$isActivityVisible")
+            return
+        }
+
         val senderName = payload.optString("senderName", "PhantomChat")
         val peerPubkey = payload.optString("peerPubkey", conversationId)
         val timestamp = payload.optLong("timestamp", System.currentTimeMillis())
@@ -321,10 +538,19 @@ class PhantomAutoService : Service() {
      * notification, then asks the running PhantomChat instance to actually send it.
      */
     fun sendReplyFromNotification(conversationId: String, text: String) {
+        if (conversationId == GENERIC_ALERT_CONVERSATION_ID) {
+            // No real peer behind this placeholder - nothing to deliver to.
+            Log.w(TAG, "ignoring reply to generic fallback alert (no real conversation)")
+            return
+        }
         val senderName = conversationPeerNames[conversationId] ?: "PhantomChat"
         val style = messagingStyleFor(conversationId, senderName)
         style.addMessage(text, System.currentTimeMillis(), null as Person?)
         notify(conversationId, style)
+
+        // Chromium often freezes the JS engine/network stack when the WebView is detached.
+        // Force a wake-up before sending the reply to ensure it hits the wire immediately.
+        wakeWebView()
 
         val script = buildSendReplyScript(conversationId, text)
         webView?.evaluateJavascript(script, null)
@@ -420,7 +646,10 @@ class PhantomAutoService : Service() {
             .setShortcutId(conversationId)
             .build()
 
-        NotificationManagerCompat.from(this).notify(notificationId, notification)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) 
+            == PackageManager.PERMISSION_GRANTED) {
+            NotificationManagerCompat.from(this).notify(notificationId, notification)
+        }
     }
 
     /** Invoked by MarkReadReceiver - Android Auto (and other surfaces) may fire the
@@ -468,51 +697,6 @@ class PhantomAutoService : Service() {
         )
     }
 
-    private fun acquireWakeLock() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PhantomAuto::ServiceWakeLock").also {
-            // Keep the CPU awake while the service is running. A 12-hour timeout as a safety net
-            // to ensure it eventually releases even if onDestroy is somehow bypassed.
-            it.acquire(12 * 60 * 60 * 1000L /*12 hours*/)
-        }
-    }
-
-    private fun releaseWakeLock() {
-        wakeLock?.let {
-            if (it.isHeld) {
-                it.release()
-            }
-        }
-        wakeLock = null
-    }
-
-    private fun acquireWifiLock() {
-        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        wifiLock = wifiManager.createWifiLock(
-            WifiManager.WIFI_MODE_FULL,
-            "PhantomAuto::WifiLock"
-        ).also {
-            it.acquire()
-        }
-    }
-
-    private fun releaseWifiLock() {
-        wifiLock?.let {
-            if (it.isHeld) {
-                it.release()
-            }
-        }
-        wifiLock = null
-    }
-
-    private fun startKeepAlive() {
-        keepAliveHandler.postDelayed(keepAliveRunnable, 30_000)
-    }
-
-    private fun stopKeepAlive() {
-        keepAliveHandler.removeCallbacks(keepAliveRunnable)
-    }
-
     private fun buildConnectionNotification(): Notification {
         val openAppIntent = Intent(this, MainActivity::class.java)
         val contentIntent = PendingIntent.getActivity(
@@ -530,12 +714,23 @@ class PhantomAutoService : Service() {
 
     override fun onDestroy() {
         instance = null
-        stopKeepAlive()
-        detachFromOverlay()
-        releaseWifiLock()
-        releaseWakeLock()
-        webView?.destroy()
+        tickHandler.removeCallbacks(tickRunnable)
+        carConnection.type.removeObserver(carConnectionObserver)
+        relayWakeListener?.stop()
+        relayWakeListener = null
+        
+        webView?.let {
+            (it.parent as? ViewGroup)?.removeView(it)
+            it.destroy()
+        }
         webView = null
+        
+        ghostDisplay?.release()
+        ghostDisplay = null
+        ghostSurfaceTexture?.release()
+        ghostSurfaceTexture = null
+        ghostWindowManager = null
+        
         super.onDestroy()
     }
 
