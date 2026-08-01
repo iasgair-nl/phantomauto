@@ -3,6 +3,13 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Release signing is driven entirely by environment variables so CI can inject a
+// keystore without any secrets living in the repo. When RELEASE_KEYSTORE is not
+// set (local dev, or CI without secrets configured) the release build simply
+// stays unsigned instead of failing.
+val releaseKeystorePath: String? = System.getenv("RELEASE_KEYSTORE")?.takeIf { it.isNotBlank() }
+val releaseKeystoreFile = releaseKeystorePath?.let { file(it) }?.takeIf { it.exists() }
+
 android {
     namespace = "chat.phantomyard.auto"
     compileSdk = 35
@@ -15,9 +22,21 @@ android {
         versionName = "0.1.0"
     }
 
+    signingConfigs {
+        if (releaseKeystoreFile != null) {
+            create("release") {
+                storeFile = releaseKeystoreFile
+                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 

@@ -104,14 +104,16 @@ class PhantomAutoService : Service() {
 
     /**
      * Whether the MainActivity is currently in the foreground (hosting the WebView).
-     * Notifications are gated when the user is actively looking at the app.
+     * Notifications are generally gated when the user is actively looking at the app on the phone,
+     * unless we are engaged via Android Auto (where notifications on the car screen are still
+     * desired even if the phone app is open).
      */
     var isActivityVisible: Boolean = false
         set(value) {
             if (field != value) {
                 Log.d(TAG, "activity visible=$value")
                 field = value
-                if (value) {
+                if (value && !engagedViaAndroidAuto) {
                     clearGenericNotifications()
                 }
             }
@@ -443,8 +445,10 @@ class PhantomAutoService : Service() {
     private fun onGiftWrapWake(eventId: String) {
         wakeWebView()
 
-        // Only show notifications if engaged via Android Auto and the app isn't active.
-        if (!engagedViaAndroidAuto || isActivityVisible) {
+        // Only show notifications if engaged via Android Auto. We allow them even if the
+        // app is active, because the user might have opened it specifically to keep the
+        // JS engine alive for Android Auto.
+        if (!engagedViaAndroidAuto) {
             return
         }
 
@@ -505,9 +509,9 @@ class PhantomAutoService : Service() {
         messagingStyles.remove(GENERIC_ALERT_CONVERSATION_ID)
         NotificationManagerCompat.from(this).cancel(GENERIC_ALERT_CONVERSATION_ID.hashCode())
 
-        // Only show notifications if engaged via Android Auto and the app isn't active.
-        if (!engagedViaAndroidAuto || isActivityVisible) {
-            Log.d(TAG, "suppressing notification: AA=$engagedViaAndroidAuto, visible=$isActivityVisible")
+        // Only show notifications if engaged via Android Auto.
+        if (!engagedViaAndroidAuto) {
+            Log.d(TAG, "suppressing notification: not engaged via Android Auto")
             return
         }
 
