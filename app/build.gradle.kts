@@ -1,13 +1,20 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
 
-// Release signing is driven entirely by environment variables so CI can inject a
-// keystore without any secrets living in the repo. When RELEASE_KEYSTORE is not
-// set (local dev, or CI without secrets configured) the release build simply
-// stays unsigned instead of failing.
-val releaseKeystorePath: String? = System.getenv("RELEASE_KEYSTORE")?.takeIf { it.isNotBlank() }
+// Release signing can be driven by environment variables (CI) or local.properties (local dev).
+// Secrets should never be checked into the repo.
+val props = Properties()
+val propFile = rootProject.file("local.properties")
+if (propFile.exists()) {
+    propFile.inputStream().use { props.load(it) }
+}
+
+val releaseKeystorePath: String? = (System.getenv("RELEASE_KEYSTORE") ?: props.getProperty("signing.storeFile"))
+    ?.takeIf { it.isNotBlank() }
 val releaseKeystoreFile = releaseKeystorePath?.let { file(it) }?.takeIf { it.exists() }
 
 android {
@@ -26,9 +33,9 @@ android {
         if (releaseKeystoreFile != null) {
             create("release") {
                 storeFile = releaseKeystoreFile
-                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
-                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD") ?: props.getProperty("signing.storePassword")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: props.getProperty("signing.keyAlias")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: props.getProperty("signing.keyPassword")
             }
         }
     }
@@ -37,6 +44,10 @@ android {
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.findByName("release")
+        }
+        debug {
+            // Use the release signing config if available, so we can overwrite CI builds locally
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 

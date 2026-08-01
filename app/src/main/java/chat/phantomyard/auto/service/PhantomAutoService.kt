@@ -64,7 +64,7 @@ private const val MESSAGE_CHANNEL_ID = "phantomauto_messages"
 // unconditional 30s spam - fast while actively driving (when timely delivery
 // matters most), backed off aggressively otherwise (when it doesn't).
 private const val ENGAGED_TICK_INTERVAL_MS = 60_000L // 1 minute, while connected to Android Auto
-private const val IDLE_TICK_INTERVAL_MS = 12 * 60_000L // 12 minutes, otherwise
+private const val IDLE_TICK_INTERVAL_MS = 30 * 60_000L // 30 minutes, otherwise
 
 // Grace period between a raw gift-wrap event being detected (via RelayWakeListener,
 // before decryption) and falling back to a content-free alert - gives the WebView a
@@ -101,6 +101,8 @@ class PhantomAutoService : Service() {
 
     private val tickHandler = Handler(Looper.getMainLooper())
     @Volatile private var engagedViaAndroidAuto = false
+    private var lastKnownOwnId: String? = null
+    private var lastKnownRelays: List<String>? = null
 
     /**
      * Whether the MainActivity is currently in the foreground (hosting the WebView).
@@ -113,6 +115,7 @@ class PhantomAutoService : Service() {
             if (field != value) {
                 Log.d(TAG, "activity visible=$value")
                 field = value
+                updateState()
                 if (value && !engagedViaAndroidAuto) {
                     clearGenericNotifications()
                 }
@@ -134,11 +137,7 @@ class PhantomAutoService : Service() {
         Log.d(TAG, "car connection type=$type engaged=$nowEngaged")
         if (nowEngaged != engagedViaAndroidAuto) {
             engagedViaAndroidAuto = nowEngaged
-            // Reschedule immediately on a state change instead of waiting out whatever
-            // interval was already in flight, so switching to the fast cadence the moment
-            // a drive starts doesn't wait up to IDLE_TICK_INTERVAL_MS to kick in.
-            tickHandler.removeCallbacks(tickRunnable)
-            tickHandler.post(tickRunnable)
+            updateState()
         }
     }
     private val tickRunnable = object : Runnable {
@@ -152,28 +151,81 @@ class PhantomAutoService : Service() {
 
     private fun wakeWebView() {
         val view = webView ?: return
-        val metrics = resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-
+        
         // Chromium background throttling is notoriously hard to bypass.
-        // We simulate a full visibility and focus cycle to trick the engine
-        // into thinking it's actively rendering on a real window.
+        // resumeTimers() is essential for background execution.
         view.onResume()
         view.resumeTimers()
         view.setNetworkAvailable(true)
-        
-        view.visibility = View.VISIBLE
-        view.dispatchWindowVisibilityChanged(View.VISIBLE)
-        view.dispatchWindowFocusChanged(true)
 
-        view.measure(
-            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
-        )
-        view.layout(0, 0, width, height)
-        view.requestLayout()
+        if (engagedViaAndroidAuto || isActivityVisible) {
+            // Full visibility cycle for active driving or foreground app
+            val metrics = resources.displayMetrics
+            val width = metrics.widthPixels
+            val height = metrics.heightPixels
+            
+            view.visibility = View.VISIBLE
+            view.dispatchWindowVisibilityChanged(View.VISIBLE)
+            view.dispatchWindowFocusChanged(true)
+
+            view.measure(
+                View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
+            )
+            view.layout(0, 0, width, height)
+            view.requestLayout()
+        }
+        
+        // Dispatching 'online' is enough to nudge the Nostr pool in background
         view.evaluateJavascript("window.dispatchEvent(new Event('online')); void 0;", null)
+    }
+
+    private fun updateState() {
+        Log.d(TAG, "updating state: engaged=$engagedViaAndroidAuto, visible=$isActivityVisible")
+        
+        // 1. Tick Cadence: Reschedule immediately to apply new interval
+        tickHandler.removeCallbacks(tickRunnable)
+        tickHandler.post(tickRunnable)
+        
+        // 2. RelayWakeListener: Only run if engaged with car
+        if (engagedViaAndroidAuto) {
+            val ownId = lastKnownOwnId
+            val relays = lastKnownRelays
+            if (ownId != null && relays != null) {
+                if (relayWakeListener == null) {
+                    Log.d(TAG, "starting RelayWakeListener for car connection")
+                    relayWakeListener = RelayWakeListener(ownId, relays) { eventId -> onGiftWrapWake(eventId) }
+                        .also { it.start() }
+                }
+            }
+        } else {
+            if (relayWakeListener != null) {
+                Log.d(TAG, "stopping RelayWakeListener: not engaged")
+                relayWakeListener?.stop()
+                relayWakeListener = null
+            }
+        }
+        
+        // 3. Ghost Window: Only needed if engaged but app not visible on phone
+        if (engagedViaAndroidAuto && !isActivityVisible) {
+            if (ghostWindowManager == null) {
+                setupGhostWindow()
+            }
+            moveWebViewToBackground()
+        } else if (!engagedViaAndroidAuto && !isActivityVisible) {
+            // Not engaged and not visible: release ghost window resources
+            releaseGhostWindow()
+        }
+    }
+
+    private fun releaseGhostWindow() {
+        Log.d(TAG, "releasing ghost window")
+        webView?.let { removeFromParent(it) }
+        ghostDisplay?.release()
+        ghostDisplay = null
+        ghostSurfaceTexture?.release()
+        ghostSurfaceTexture = null
+        ghostWindowManager = null
     }
 
     // Context (needed for getString) isn't attached yet when property initializers run,
@@ -211,10 +263,9 @@ class PhantomAutoService : Service() {
             buildConnectionNotification(),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
         )
-        setupGhostWindow()
         carConnection = CarConnection(applicationContext)
         carConnection.type.observeForever(carConnectionObserver)
-        tickHandler.post(tickRunnable)
+        updateState()
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -413,11 +464,14 @@ class PhantomAutoService : Service() {
         when (type) {
             "message" -> payload?.let { showIncomingMessageNotification(it) }
             "replyResult" -> payload?.let { logReplyResult(it) }
-            "ready" -> payload?.let { startRelayWakeListener(it) }
+            "ready" -> payload?.let { 
+                captureReadyState(it)
+                updateState()
+            }
         }
     }
 
-    private fun startRelayWakeListener(payload: JSONObject) {
+    private fun captureReadyState(payload: JSONObject) {
         val ownId = payload.optString("ownId").takeIf { it.isNotEmpty() } ?: return
         val relaysJson = payload.optJSONArray("relays")
         val relays = mutableListOf<String>()
@@ -427,12 +481,11 @@ class PhantomAutoService : Service() {
             }
         }
         if (relays.isEmpty()) {
-            Log.w(TAG, "no relays reported by bridge, not starting RelayWakeListener")
+            Log.w(TAG, "no relays reported by bridge")
             return
         }
-        relayWakeListener?.stop()
-        relayWakeListener = RelayWakeListener(ownId, relays) { eventId -> onGiftWrapWake(eventId) }
-            .also { it.start() }
+        lastKnownOwnId = ownId
+        lastKnownRelays = relays
     }
 
     /**

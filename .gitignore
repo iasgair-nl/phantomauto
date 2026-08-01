@@ -9,3 +9,4 @@
 .cxx
 app/build/
 app/release/
+/*.jks
